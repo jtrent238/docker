@@ -137,7 +137,7 @@ func populateCommand(c *Container, env []string) error {
 		LayerFolder: layerFolder,
 		LayerPaths:  layerPaths,
 		Hostname:    c.Config.Hostname,
-		Isolated:    c.hostConfig.Isolation.IsHyperV(),
+		Isolation:   c.hostConfig.Isolation,
 	}
 
 	return nil

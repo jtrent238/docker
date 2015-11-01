@@ -7,15 +7,19 @@ func (n NetworkMode) IsDefault() bool {
 	return n == "default"
 }
 
-// IsHyperV indicates the use of Hyper-V Containers for isolation (as opposed
-// to Windows Server Containers
+// IsHyperV indicates the use of a Hyper-V partition for isolation
 func (i IsolationLevel) IsHyperV() bool {
 	return strings.ToLower(string(i)) == "hyperv"
 }
 
+// IsProcess indicates the use of process isolation
+func (i IsolationLevel) IsProcess() bool {
+	return strings.ToLower(string(i)) == "process"
+}
+
 // IsValid indicates is an isolation level is valid
 func (i IsolationLevel) IsValid() bool {
-	return i.IsDefault() || i.IsHyperV()
+	return i.IsDefault() || i.IsHyperV() || i.IsProcess()
 }
 
 // DefaultDaemonNetworkMode returns the default network stack the daemon should

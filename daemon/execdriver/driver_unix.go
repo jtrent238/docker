@@ -257,3 +257,12 @@ func Stats(containerDir string, containerMemoryLimit int64, machineMemory int64)
 		MemoryLimit: memoryLimit,
 	}, nil
 }
+
+// ExitStatus provides exit reasons for a container.
+type ExitStatus struct {
+	// The exit code with which the container exited.
+	ExitCode int
+
+	// Whether the container encountered an OOM.
+	OOMKilled bool
+}

@@ -7,6 +7,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // TestChtimes tests Chtimes access time on a tempfile on Windows
@@ -17,8 +18,15 @@ func TestChtimesWindows(t *testing.T) {
 	beforeUnixEpochTime := time.Unix(0, 0).Add(-100 * time.Second)
 	unixEpochTime := time.Unix(0, 0)
 	afterUnixEpochTime := time.Unix(100, 0)
-	// The max Unix time is 33 bits set
-	unixMaxTime := unixEpochTime.Add((1<<33 - 1) * time.Second)
+	var unixMaxTime time.Time
+	if unsafe.Sizeof(syscall.Timespec{}.Nsec) == 8 {
+		// This is a 64 bit timespec
+		// os.Chtimes limits time to the following
+		unixMaxTime = time.Unix(0, 1<<63-1)
+	} else {
+		// This is a 32 bit timespec
+		unixMaxTime = time.Unix(1<<31-1, 0)
+	}
 	afterUnixMaxTime := unixMaxTime.Add(100 * time.Second)
 
 	// Test both aTime and mTime set to Unix Epoch
@@ -82,8 +90,8 @@ func TestChtimesWindows(t *testing.T) {
 	}
 
 	aTime = time.Unix(0, f.Sys().(*syscall.Win32FileAttributeData).LastAccessTime.Nanoseconds())
-	if aTime != unixMaxTime {
-		t.Fatalf("Expected: %s, got: %s", unixMaxTime, aTime)
+	if aTime.Truncate(time.Second) != unixMaxTime.Truncate(time.Second) {
+		t.Fatalf("Expected: %s, got: %s", unixMaxTime.Truncate(time.Second), aTime.Truncate(time.Second))
 	}
 
 	// Test aTime after Unix max time and mTime set to Unix max time
@@ -108,7 +116,7 @@ func TestChtimesWindows(t *testing.T) {
 	}
 
 	aTime = time.Unix(0, f.Sys().(*syscall.Win32FileAttributeData).LastAccessTime.Nanoseconds())
-	if aTime != unixMaxTime {
-		t.Fatalf("Expected: %s, got: %s", unixMaxTime, aTime)
+	if aTime.Truncate(time.Second) != unixMaxTime.Truncate(time.Second) {
+		t.Fatalf("Expected: %s, got: %s", unixMaxTime.Truncate(time.Second), aTime.Truncate(time.Second))
 	}
 }

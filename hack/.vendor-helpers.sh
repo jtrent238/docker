@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
 
-PROJECT=github.com/docker/docker
-
-# Downloads dependencies into vendor/ directory
-mkdir -p vendor
-
-rm -rf .gopath
-mkdir -p .gopath/src/github.com/docker
-ln -sf ../../../.. .gopath/src/${PROJECT}
 export GOPATH="${PWD}/.gopath:${PWD}/vendor"
 
 clone() {
@@ -74,36 +66,41 @@ clean() {
 	local dockerPlatforms=( linux/amd64 $(_dockerfile_env DOCKER_CROSSPLATFORMS) )
 	local dockerBuildTags="$(_dockerfile_env DOCKER_BUILDTAGS)"
 	local buildTagCombos=(
-		''
-		'experimental'
-		"$dockerBuildTags"
+#		''
+#		'experimental'
+#		"$dockerBuildTags"
 		"daemon $dockerBuildTags"
-		"daemon cgo $dockerBuildTags"
-		"experimental $dockerBuildTags"
-		"experimental daemon $dockerBuildTags"
-		"experimental daemon cgo $dockerBuildTags"
+#		"daemon cgo $dockerBuildTags"
+#		"experimental $dockerBuildTags"
+#		"experimental daemon $dockerBuildTags"
+#		"experimental daemon cgo $dockerBuildTags"
 	)
-
-	echo
 
 	echo -n 'collecting import graph, '
 	local IFS=$'\n'
 	local imports=( $(
 		for platform in "${dockerPlatforms[@]}"; do
+	echo "JJH Top of loop 1"
 			export GOOS="${platform%/*}";
 			export GOARCH="${platform##*/}";
 			for buildTags in "${buildTagCombos[@]}"; do
+echo go list -e -tags "$buildTags" -f '{{join .Deps "\n"}}' "${packages[@]}" "****JJH EOL"
+go list -e -tags "$buildTags" -f '{{join .Deps "\n"}}' "${packages[@]}"
 				pkgs=( $(go list -e -tags "$buildTags" -f '{{join .Deps "\n"}}' "${packages[@]}" | grep -E "^${PROJECT}" | grep -vE "^${PROJECT}/vendor" | sort -u) )
+echo "Loop 2 pkgs " $pkgs				
 				pkgs+=( ${packages[@]} )
+echo "After append " $pkgs
 				testImports=( $(go list -e -tags "$buildTags" -f '{{join .TestImports "\n"}}' "${pkgs[@]}" | sort -u) )
 				printf '%s\n' "${testImports[@]}"
 				go list -e -tags "$buildTags" -f '{{join .Deps "\n"}}' "${packages[@]} ${testImports[@]}"
 			done
 		done | grep -vE "^${PROJECT}" | sort -u
 	) )
+echo $(go list -e -f '{{if not .Standard}}{{.ImportPath}}{{end}}' "${imports[@]}")
 	imports=( $(go list -e -f '{{if not .Standard}}{{.ImportPath}}{{end}}' "${imports[@]}") )
 	unset IFS
 
+#exit 1
 	echo -n 'pruning unused packages, '
 	findArgs=(
 		# This directory contains only .c and .h files which are necessary

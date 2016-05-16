@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"runtime"
 	"syscall"
@@ -45,7 +46,10 @@ func untar() {
 		fatal(err)
 	}
 	// fully consume stdin in case it is zero padded
-	flush(os.Stdin)
+	if _, err := flush(os.Stdin); err != nil {
+		fatal(err)
+	}
+
 	os.Exit(0)
 }
 
@@ -79,6 +83,11 @@ func invokeUnpack(decompressedArchive io.Reader, dest string, options *archive.T
 	w.Close()
 
 	if err := cmd.Wait(); err != nil {
+		// when `xz -d -c -q | docker-untar ...` failed on docker-untar side,
+		// we need to exhaust `xz`'s output, otherwise the `xz` side will be
+		// pending on write pipe forever
+		io.Copy(ioutil.Discard, decompressedArchive)
+
 		return fmt.Errorf("Untar re-exec error: %v: output: %s", err, output)
 	}
 	return nil

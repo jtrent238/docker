@@ -4,19 +4,22 @@
 package local
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
+	"github.com/Sirupsen/logrus"
+	"github.com/docker/docker/pkg/idtools"
+	"github.com/docker/docker/pkg/mount"
+	"github.com/docker/docker/utils"
 	"github.com/docker/docker/volume"
 )
 
 // VolumeDataPathName is the name of the directory where the volume data is stored.
-// It uses a very distintive name to avoid collisions migrating data between
+// It uses a very distinctive name to avoid collisions migrating data between
 // Docker versions.
 const (
 	VolumeDataPathName = "_data"
@@ -25,17 +28,33 @@ const (
 
 var (
 	// ErrNotFound is the typed error returned when the requested volume name can't be found
-	ErrNotFound = errors.New("volume not found")
-	oldVfsDir   = filepath.Join("vfs", "dir")
+	ErrNotFound = fmt.Errorf("volume not found")
+	// volumeNameRegex ensures the name assigned for the volume is valid.
+	// This name is used to create the bind directory, so we need to avoid characters that
+	// would make the path to escape the root directory.
+	volumeNameRegex = utils.RestrictedVolumeNamePattern
 )
+
+type validationError struct {
+	error
+}
+
+func (validationError) IsValidationError() bool {
+	return true
+}
+
+type activeMount struct {
+	count   uint64
+	mounted bool
+}
 
 // New instantiates a new Root instance with the provided scope. Scope
 // is the base path that the Root instance uses to store its
 // volumes. The base path is created here if it does not exist.
-func New(scope string) (*Root, error) {
+func New(scope string, rootUID, rootGID int) (*Root, error) {
 	rootDirectory := filepath.Join(scope, volumesPathName)
 
-	if err := os.MkdirAll(rootDirectory, 0700); err != nil {
+	if err := idtools.MkdirAllAs(rootDirectory, 0700, rootUID, rootGID); err != nil {
 		return nil, err
 	}
 
@@ -43,6 +62,8 @@ func New(scope string) (*Root, error) {
 		scope:   scope,
 		path:    rootDirectory,
 		volumes: make(map[string]*localVolume),
+		rootUID: rootUID,
+		rootGID: rootGID,
 	}
 
 	dirs, err := ioutil.ReadDir(rootDirectory)
@@ -50,12 +71,35 @@ func New(scope string) (*Root, error) {
 		return nil, err
 	}
 
+	mountInfos, err := mount.GetMounts()
+	if err != nil {
+		logrus.Debugf("error looking up mounts for local volume cleanup: %v", err)
+	}
+
 	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+
 		name := filepath.Base(d.Name())
-		r.volumes[name] = &localVolume{
+		v := &localVolume{
 			driverName: r.Name(),
 			name:       name,
 			path:       r.DataPath(name),
+		}
+		r.volumes[name] = v
+		if b, err := ioutil.ReadFile(filepath.Join(name, "opts.json")); err == nil {
+			if err := json.Unmarshal(b, v.opts); err != nil {
+				return nil, err
+			}
+
+			// unmount anything that may still be mounted (for example, from an unclean shutdown)
+			for _, info := range mountInfos {
+				if info.Mountpoint == v.path {
+					mount.Unmount(v.path)
+					break
+				}
+			}
 		}
 	}
 
@@ -70,15 +114,19 @@ type Root struct {
 	scope   string
 	path    string
 	volumes map[string]*localVolume
+	rootUID int
+	rootGID int
 }
 
 // List lists all the volumes
-func (r *Root) List() []volume.Volume {
+func (r *Root) List() ([]volume.Volume, error) {
 	var ls []volume.Volume
+	r.m.Lock()
 	for _, v := range r.volumes {
 		ls = append(ls, v)
 	}
-	return ls
+	r.m.Unlock()
+	return ls, nil
 }
 
 // DataPath returns the constructed path of this volume.
@@ -94,7 +142,11 @@ func (r *Root) Name() string {
 // Create creates a new volume.Volume with the provided name, creating
 // the underlying directory tree required for this volume in the
 // process.
-func (r *Root) Create(name string, _ map[string]string) (volume.Volume, error) {
+func (r *Root) Create(name string, opts map[string]string) (volume.Volume, error) {
+	if err := r.validateName(name); err != nil {
+		return nil, err
+	}
+
 	r.m.Lock()
 	defer r.m.Unlock()
 
@@ -104,17 +156,40 @@ func (r *Root) Create(name string, _ map[string]string) (volume.Volume, error) {
 	}
 
 	path := r.DataPath(name)
-	if err := os.MkdirAll(path, 0755); err != nil {
+	if err := idtools.MkdirAllAs(path, 0755, r.rootUID, r.rootGID); err != nil {
 		if os.IsExist(err) {
 			return nil, fmt.Errorf("volume already exists under %s", filepath.Dir(path))
 		}
 		return nil, err
 	}
+
+	var err error
+	defer func() {
+		if err != nil {
+			os.RemoveAll(filepath.Dir(path))
+		}
+	}()
+
 	v = &localVolume{
 		driverName: r.Name(),
 		name:       name,
 		path:       path,
 	}
+
+	if opts != nil {
+		if err = setOpts(v, opts); err != nil {
+			return nil, err
+		}
+		var b []byte
+		b, err = json.Marshal(v.opts)
+		if err != nil {
+			return nil, err
+		}
+		if err = ioutil.WriteFile(filepath.Join(filepath.Dir(path), "opts.json"), b, 600); err != nil {
+			return nil, err
+		}
+	}
+
 	r.volumes[name] = v
 	return v, nil
 }
@@ -126,25 +201,40 @@ func (r *Root) Create(name string, _ map[string]string) (volume.Volume, error) {
 func (r *Root) Remove(v volume.Volume) error {
 	r.m.Lock()
 	defer r.m.Unlock()
+
 	lv, ok := v.(*localVolume)
 	if !ok {
-		return errors.New("unknown volume type")
+		return fmt.Errorf("unknown volume type %T", v)
 	}
 
 	realPath, err := filepath.EvalSymlinks(lv.path)
 	if err != nil {
-		return err
-	}
-	if !r.scopedPath(realPath) {
-		return fmt.Errorf("Unable to remove a directory of out the Docker root: %s", realPath)
+		if !os.IsNotExist(err) {
+			return err
+		}
+		realPath = filepath.Dir(lv.path)
 	}
 
-	if err := os.RemoveAll(realPath); err != nil {
+	if !r.scopedPath(realPath) {
+		return fmt.Errorf("Unable to remove a directory of out the Docker root %s: %s", r.scope, realPath)
+	}
+
+	if err := removePath(realPath); err != nil {
 		return err
 	}
 
 	delete(r.volumes, lv.name)
-	return os.RemoveAll(filepath.Dir(lv.path))
+	return removePath(filepath.Dir(lv.path))
+}
+
+func removePath(path string) error {
+	if err := os.RemoveAll(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // Get looks up the volume for the given name and returns it if found
@@ -158,20 +248,11 @@ func (r *Root) Get(name string) (volume.Volume, error) {
 	return v, nil
 }
 
-// scopedPath verifies that the path where the volume is located
-// is under Docker's root and the valid local paths.
-func (r *Root) scopedPath(realPath string) bool {
-	// Volumes path for Docker version >= 1.7
-	if strings.HasPrefix(realPath, filepath.Join(r.scope, volumesPathName)) {
-		return true
+func (r *Root) validateName(name string) error {
+	if !volumeNameRegex.MatchString(name) {
+		return validationError{fmt.Errorf("%q includes invalid characters for a local volume name, only %q are allowed", name, utils.RestrictedNameChars)}
 	}
-
-	// Volumes path for Docker version < 1.7
-	if strings.HasPrefix(realPath, filepath.Join(r.scope, oldVfsDir)) {
-		return true
-	}
-
-	return false
+	return nil
 }
 
 // localVolume implements the Volume interface from the volume package and
@@ -185,6 +266,10 @@ type localVolume struct {
 	path string
 	// driverName is the name of the driver that created the volume.
 	driverName string
+	// opts is the parsed list of options used to create the volume
+	opts *optsConfig
+	// active refcounts the active mounts
+	active activeMount
 }
 
 // Name returns the name of the given Volume.
@@ -204,10 +289,42 @@ func (v *localVolume) Path() string {
 
 // Mount implements the localVolume interface, returning the data location.
 func (v *localVolume) Mount() (string, error) {
+	v.m.Lock()
+	defer v.m.Unlock()
+	if v.opts != nil {
+		if !v.active.mounted {
+			if err := v.mount(); err != nil {
+				return "", err
+			}
+			v.active.mounted = true
+		}
+		v.active.count++
+	}
 	return v.path, nil
 }
 
 // Umount is for satisfying the localVolume interface and does not do anything in this driver.
 func (v *localVolume) Unmount() error {
+	v.m.Lock()
+	defer v.m.Unlock()
+	if v.opts != nil {
+		v.active.count--
+		if v.active.count == 0 {
+			if err := mount.Unmount(v.path); err != nil {
+				v.active.count++
+				return err
+			}
+			v.active.mounted = false
+		}
+	}
+	return nil
+}
+
+func validateOpts(opts map[string]string) error {
+	for opt := range opts {
+		if !validOpts[opt] {
+			return validationError{fmt.Errorf("invalid option key: %q", opt)}
+		}
+	}
 	return nil
 }

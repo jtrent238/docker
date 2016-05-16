@@ -6,7 +6,9 @@ import (
 	"os/exec"
 	"regexp"
 	"sync"
+	"syscall"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/docker/libnetwork/types"
 	"github.com/vishvananda/netlink"
 )
@@ -19,6 +21,7 @@ type nwIface struct {
 	dstName     string
 	master      string
 	dstMaster   string
+	mac         net.HardwareAddr
 	address     *net.IPNet
 	addressIPv6 *net.IPNet
 	routes      []*net.IPNet
@@ -60,6 +63,13 @@ func (i *nwIface) Master() string {
 	defer i.Unlock()
 
 	return i.master
+}
+
+func (i *nwIface) MacAddress() net.HardwareAddr {
+	i.Lock()
+	defer i.Unlock()
+
+	return types.GetMacCopy(i.mac)
 }
 
 func (i *nwIface) Address() *net.IPNet {
@@ -109,6 +119,7 @@ func (i *nwIface) Remove() error {
 
 	n.Lock()
 	path := n.path
+	isDefault := n.isDefault
 	n.Unlock()
 
 	return nsInvoke(path, func(nsFD int) error { return nil }, func(callerFD int) error {
@@ -125,7 +136,7 @@ func (i *nwIface) Remove() error {
 
 		err = netlink.LinkSetName(iface, i.SrcName())
 		if err != nil {
-			fmt.Println("LinkSetName failed: ", err)
+			log.Debugf("LinkSetName failed for interface %s: %v", i.SrcName(), err)
 			return err
 		}
 
@@ -134,10 +145,10 @@ func (i *nwIface) Remove() error {
 			if err := netlink.LinkDel(iface); err != nil {
 				return fmt.Errorf("failed deleting bridge %q: %v", i.SrcName(), err)
 			}
-		} else {
+		} else if !isDefault {
 			// Move the network interface to caller namespace.
 			if err := netlink.LinkSetNsFd(iface, callerFD); err != nil {
-				fmt.Println("LinkSetNsPid failed: ", err)
+				log.Debugf("LinkSetNsPid failed for interface %s: %v", i.SrcName(), err)
 				return err
 			}
 		}
@@ -156,7 +167,7 @@ func (i *nwIface) Remove() error {
 }
 
 // Returns the sandbox's side veth interface statistics
-func (i *nwIface) Statistics() (*InterfaceStatistics, error) {
+func (i *nwIface) Statistics() (*types.InterfaceStatistics, error) {
 	i.Lock()
 	n := i.ns
 	i.Unlock()
@@ -165,7 +176,7 @@ func (i *nwIface) Statistics() (*InterfaceStatistics, error) {
 	path := n.path
 	n.Unlock()
 
-	s := &InterfaceStatistics{}
+	s := &types.InterfaceStatistics{}
 
 	err := nsInvoke(path, func(nsFD int) error { return nil }, func(callerFD int) error {
 		// For some reason ioutil.ReadFile(netStatsFile) reads the file in
@@ -213,9 +224,15 @@ func (n *networkNamespace) AddInterface(srcName, dstPrefix string, options ...If
 	}
 
 	n.Lock()
-	i.dstName = fmt.Sprintf("%s%d", i.dstName, n.nextIfIndex)
-	n.nextIfIndex++
+	if n.isDefault {
+		i.dstName = i.srcName
+	} else {
+		i.dstName = fmt.Sprintf("%s%d", i.dstName, n.nextIfIndex)
+		n.nextIfIndex++
+	}
+
 	path := n.path
+	isDefault := n.isDefault
 	n.Unlock()
 
 	return nsInvoke(path, func(nsFD int) error {
@@ -231,9 +248,13 @@ func (n *networkNamespace) AddInterface(srcName, dstPrefix string, options ...If
 			return fmt.Errorf("failed to get link by name %q: %v", i.srcName, err)
 		}
 
-		// Move the network interface to the destination namespace.
-		if err := netlink.LinkSetNsFd(iface, nsFD); err != nil {
-			return fmt.Errorf("failed to set namespace on link %q: %v", i.srcName, err)
+		// Move the network interface to the destination
+		// namespace only if the namespace is not a default
+		// type
+		if !isDefault {
+			if err := netlink.LinkSetNsFd(iface, nsFD); err != nil {
+				return fmt.Errorf("failed to set namespace on link %q: %v", i.srcName, err)
+			}
 		}
 
 		return nil
@@ -271,6 +292,11 @@ func (n *networkNamespace) AddInterface(srcName, dstPrefix string, options ...If
 			return fmt.Errorf("failed to set link up: %v", err)
 		}
 
+		// Set the routes on the interface. This can only be done when the interface is up.
+		if err := setInterfaceRoutes(iface, i); err != nil {
+			return fmt.Errorf("error setting interface %q routes to %q: %v", iface.Attrs().Name, i.Routes(), err)
+		}
+
 		n.Lock()
 		n.iFaces = append(n.iFaces, i)
 		n.Unlock()
@@ -286,9 +312,9 @@ func configureInterface(iface netlink.Link, i *nwIface) error {
 		ErrMessage string
 	}{
 		{setInterfaceName, fmt.Sprintf("error renaming interface %q to %q", ifaceName, i.DstName())},
-		{setInterfaceIP, fmt.Sprintf("error setting interface %q IP to %q", ifaceName, i.Address())},
-		{setInterfaceIPv6, fmt.Sprintf("error setting interface %q IPv6 to %q", ifaceName, i.AddressIPv6())},
-		{setInterfaceRoutes, fmt.Sprintf("error setting interface %q routes to %q", ifaceName, i.Routes())},
+		{setInterfaceMAC, fmt.Sprintf("error setting interface %q MAC to %q", ifaceName, i.MacAddress())},
+		{setInterfaceIP, fmt.Sprintf("error setting interface %q IP to %v", ifaceName, i.Address())},
+		{setInterfaceIPv6, fmt.Sprintf("error setting interface %q IPv6 to %v", ifaceName, i.AddressIPv6())},
 		{setInterfaceMaster, fmt.Sprintf("error setting interface %q master to %q", ifaceName, i.DstMaster())},
 	}
 
@@ -309,6 +335,13 @@ func setInterfaceMaster(iface netlink.Link, i *nwIface) error {
 		LinkAttrs: netlink.LinkAttrs{Name: i.DstMaster()}})
 }
 
+func setInterfaceMAC(iface netlink.Link, i *nwIface) error {
+	if i.MacAddress() == nil {
+		return nil
+	}
+	return netlink.LinkSetHardwareAddr(iface, i.MacAddress())
+}
+
 func setInterfaceIP(iface netlink.Link, i *nwIface) error {
 	if i.Address() == nil {
 		return nil
@@ -322,7 +355,7 @@ func setInterfaceIPv6(iface netlink.Link, i *nwIface) error {
 	if i.AddressIPv6() == nil {
 		return nil
 	}
-	ipAddr := &netlink.Addr{IPNet: i.AddressIPv6(), Label: ""}
+	ipAddr := &netlink.Addr{IPNet: i.AddressIPv6(), Label: "", Flags: syscall.IFA_F_NODAD}
 	return netlink.AddrAdd(iface, ipAddr)
 }
 
@@ -346,13 +379,13 @@ func setInterfaceRoutes(iface netlink.Link, i *nwIface) error {
 
 // In older kernels (like the one in Centos 6.6 distro) sysctl does not have netns support. Therefore
 // we cannot gather the statistics from /sys/class/net/<dev>/statistics/<counter> files. Per-netns stats
-// are naturally found in /proc/net/dev in kernels which support netns (ifconfig relyes on that).
+// are naturally found in /proc/net/dev in kernels which support netns (ifconfig relies on that).
 const (
 	netStatsFile = "/proc/net/dev"
 	base         = "[ ]*%s:([ ]+[0-9]+){16}"
 )
 
-func scanInterfaceStats(data, ifName string, i *InterfaceStatistics) error {
+func scanInterfaceStats(data, ifName string, i *types.InterfaceStatistics) error {
 	var (
 		bktStr string
 		bkt    uint64

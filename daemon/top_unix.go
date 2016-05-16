@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/engine-api/types"
 )
 
 // ContainerTop lists the processes running inside of the given
@@ -21,23 +21,27 @@ func (daemon *Daemon) ContainerTop(name string, psArgs string) (*types.Container
 		psArgs = "-ef"
 	}
 
-	container, err := daemon.Get(name)
+	container, err := daemon.GetContainer(name)
 	if err != nil {
 		return nil, err
 	}
 
 	if !container.IsRunning() {
-		return nil, fmt.Errorf("Container %s is not running", name)
+		return nil, errNotRunning{container.ID}
 	}
 
-	pids, err := daemon.ExecutionDriver().GetPidsForContainer(container.ID)
+	if container.IsRestarting() {
+		return nil, errContainerIsRestarting(container.ID)
+	}
+
+	pids, err := daemon.containerd.GetPidsForContainer(container.ID)
 	if err != nil {
 		return nil, err
 	}
 
 	output, err := exec.Command("ps", strings.Split(psArgs, " ")...).Output()
 	if err != nil {
-		return nil, fmt.Errorf("Error running ps: %s", err)
+		return nil, fmt.Errorf("Error running ps: %v", err)
 	}
 
 	procList := &types.ContainerProcessList{}
@@ -76,6 +80,6 @@ func (daemon *Daemon) ContainerTop(name string, psArgs string) (*types.Container
 			}
 		}
 	}
-	container.logEvent("top")
+	daemon.LogContainerEvent(container, "top")
 	return procList, nil
 }

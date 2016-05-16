@@ -2,127 +2,144 @@ package daemon
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/graph/tags"
+	"github.com/docker/docker/container"
 	"github.com/docker/docker/image"
-	"github.com/docker/docker/pkg/parsers"
+	"github.com/docker/docker/layer"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/runconfig"
+	volumestore "github.com/docker/docker/volume/store"
+	"github.com/docker/engine-api/types"
+	containertypes "github.com/docker/engine-api/types/container"
+	networktypes "github.com/docker/engine-api/types/network"
 	"github.com/opencontainers/runc/libcontainer/label"
 )
 
-// ContainerCreate takes configs and creates a container.
-func (daemon *Daemon) ContainerCreate(name string, config *runconfig.Config, hostConfig *runconfig.HostConfig, adjustCPUShares bool) (*Container, []string, error) {
-	if config == nil {
-		return nil, nil, fmt.Errorf("Config cannot be empty in order to create a container")
+// ContainerCreate creates a container.
+func (daemon *Daemon) ContainerCreate(params types.ContainerCreateConfig) (types.ContainerCreateResponse, error) {
+	if params.Config == nil {
+		return types.ContainerCreateResponse{}, fmt.Errorf("Config cannot be empty in order to create a container")
 	}
 
-	warnings, err := daemon.verifyContainerSettings(hostConfig, config)
-	daemon.adaptContainerSettings(hostConfig, adjustCPUShares)
+	warnings, err := daemon.verifyContainerSettings(params.HostConfig, params.Config, false)
 	if err != nil {
-		return nil, warnings, err
+		return types.ContainerCreateResponse{Warnings: warnings}, err
 	}
 
-	container, buildWarnings, err := daemon.Create(config, hostConfig, name)
+	err = daemon.verifyNetworkingConfig(params.NetworkingConfig)
 	if err != nil {
-		if daemon.Graph().IsNotExist(err, config.Image) {
-			if strings.Contains(config.Image, "@") {
-				return nil, warnings, fmt.Errorf("No such image: %s", config.Image)
-			}
-			img, tag := parsers.ParseRepositoryTag(config.Image)
-			if tag == "" {
-				tag = tags.DefaultTag
-			}
-			return nil, warnings, fmt.Errorf("No such image: %s:%s", img, tag)
-		}
-		return nil, warnings, err
+		return types.ContainerCreateResponse{}, err
 	}
 
-	warnings = append(warnings, buildWarnings...)
+	if params.HostConfig == nil {
+		params.HostConfig = &containertypes.HostConfig{}
+	}
+	err = daemon.adaptContainerSettings(params.HostConfig, params.AdjustCPUShares)
+	if err != nil {
+		return types.ContainerCreateResponse{Warnings: warnings}, err
+	}
 
-	return container, warnings, nil
+	container, err := daemon.create(params)
+	if err != nil {
+		return types.ContainerCreateResponse{Warnings: warnings}, daemon.imageNotExistToErrcode(err)
+	}
+
+	return types.ContainerCreateResponse{ID: container.ID, Warnings: warnings}, nil
 }
 
 // Create creates a new container from the given configuration with a given name.
-func (daemon *Daemon) Create(config *runconfig.Config, hostConfig *runconfig.HostConfig, name string) (retC *Container, retS []string, retErr error) {
+func (daemon *Daemon) create(params types.ContainerCreateConfig) (retC *container.Container, retErr error) {
 	var (
-		container *Container
-		warnings  []string
+		container *container.Container
 		img       *image.Image
-		imgID     string
+		imgID     image.ID
 		err       error
 	)
 
-	if config.Image != "" {
-		img, err = daemon.repositories.LookupImage(config.Image)
+	if params.Config.Image != "" {
+		img, err = daemon.GetImage(params.Config.Image)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		if err = daemon.graph.CheckDepth(img); err != nil {
-			return nil, nil, err
-		}
-		imgID = img.ID
+		imgID = img.ID()
 	}
 
-	if err := daemon.mergeAndVerifyConfig(config, img); err != nil {
-		return nil, nil, err
+	if err := daemon.mergeAndVerifyConfig(params.Config, img); err != nil {
+		return nil, err
 	}
 
-	if hostConfig == nil {
-		hostConfig = &runconfig.HostConfig{}
-	}
-	if hostConfig.SecurityOpt == nil {
-		hostConfig.SecurityOpt, err = daemon.generateSecurityOpt(hostConfig.IpcMode, hostConfig.PidMode)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-	if container, err = daemon.newContainer(name, config, imgID); err != nil {
-		return nil, nil, err
+	if container, err = daemon.newContainer(params.Name, params.Config, imgID); err != nil {
+		return nil, err
 	}
 	defer func() {
 		if retErr != nil {
-			if err := daemon.rm(container, false); err != nil {
-				logrus.Errorf("Clean up Error! Cannot destroy container %s: %v", container.ID, err)
+			if err := daemon.cleanupContainer(container, true); err != nil {
+				logrus.Errorf("failed to cleanup container on create error: %v", err)
 			}
 		}
 	}()
 
-	if err := daemon.Register(container); err != nil {
-		return nil, nil, err
-	}
-	if err := daemon.createRootfs(container); err != nil {
-		return nil, nil, err
-	}
-	if err := daemon.setHostConfig(container, hostConfig); err != nil {
-		return nil, nil, err
-	}
-	if err := container.Mount(); err != nil {
-		return nil, nil, err
-	}
-	defer container.Unmount()
-
-	if err := createContainerPlatformSpecificSettings(container, config, img); err != nil {
-		return nil, nil, err
+	if err := daemon.setSecurityOptions(container, params.HostConfig); err != nil {
+		return nil, err
 	}
 
-	if err := container.toDiskLocking(); err != nil {
+	container.HostConfig.StorageOpt = params.HostConfig.StorageOpt
+
+	// Set RWLayer for container after mount labels have been set
+	if err := daemon.setRWLayer(container); err != nil {
+		return nil, err
+	}
+
+	rootUID, rootGID, err := idtools.GetRootUIDGID(daemon.uidMaps, daemon.gidMaps)
+	if err != nil {
+		return nil, err
+	}
+	if err := idtools.MkdirAs(container.Root, 0700, rootUID, rootGID); err != nil {
+		return nil, err
+	}
+
+	if err := daemon.setHostConfig(container, params.HostConfig); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if retErr != nil {
+			if err := daemon.removeMountPoints(container, true); err != nil {
+				logrus.Error(err)
+			}
+		}
+	}()
+
+	if err := daemon.createContainerPlatformSpecificSettings(container, params.Config, params.HostConfig); err != nil {
+		return nil, err
+	}
+
+	var endpointsConfigs map[string]*networktypes.EndpointSettings
+	if params.NetworkingConfig != nil {
+		endpointsConfigs = params.NetworkingConfig.EndpointsConfig
+	}
+
+	if err := daemon.updateContainerNetworkSettings(container, endpointsConfigs); err != nil {
+		return nil, err
+	}
+
+	if err := container.ToDisk(); err != nil {
 		logrus.Errorf("Error saving new container to disk: %v", err)
-		return nil, nil, err
+		return nil, err
 	}
-	container.logEvent("create")
-	return container, warnings, nil
+	if err := daemon.Register(container); err != nil {
+		return nil, err
+	}
+	daemon.LogContainerEvent(container, "create")
+	return container, nil
 }
 
-func (daemon *Daemon) generateSecurityOpt(ipcMode runconfig.IpcMode, pidMode runconfig.PidMode) ([]string, error) {
+func (daemon *Daemon) generateSecurityOpt(ipcMode containertypes.IpcMode, pidMode containertypes.PidMode) ([]string, error) {
 	if ipcMode.IsHost() || pidMode.IsHost() {
 		return label.DisableSecOpt(), nil
 	}
 	if ipcContainer := ipcMode.Container(); ipcContainer != "" {
-		c, err := daemon.Get(ipcContainer)
+		c, err := daemon.GetContainer(ipcContainer)
 		if err != nil {
 			return nil, err
 		}
@@ -132,16 +149,39 @@ func (daemon *Daemon) generateSecurityOpt(ipcMode runconfig.IpcMode, pidMode run
 	return nil, nil
 }
 
+func (daemon *Daemon) setRWLayer(container *container.Container) error {
+	var layerID layer.ChainID
+	if container.ImageID != "" {
+		img, err := daemon.imageStore.Get(container.ImageID)
+		if err != nil {
+			return err
+		}
+		layerID = img.RootFS.ChainID()
+	}
+	rwLayer, err := daemon.layerStore.CreateRWLayer(container.ID, layerID, container.MountLabel, daemon.setupInitLayer, container.HostConfig.StorageOpt)
+	if err != nil {
+		return err
+	}
+	container.RWLayer = rwLayer
+
+	return nil
+}
+
 // VolumeCreate creates a volume with the specified name, driver, and opts
 // This is called directly from the remote API
-func (daemon *Daemon) VolumeCreate(name, driverName string, opts map[string]string) (*types.Volume, error) {
+func (daemon *Daemon) VolumeCreate(name, driverName string, opts, labels map[string]string) (*types.Volume, error) {
 	if name == "" {
 		name = stringid.GenerateNonCryptoID()
 	}
 
-	v, err := daemon.volumes.Create(name, driverName, opts)
+	v, err := daemon.volumes.Create(name, driverName, opts, labels)
 	if err != nil {
+		if volumestore.IsNameConflict(err) {
+			return nil, fmt.Errorf("A volume named %s already exists. Choose a different volume name.", name)
+		}
 		return nil, err
 	}
+
+	daemon.LogVolumeEvent(v.Name(), "create", map[string]string{"driver": v.DriverName()})
 	return volumeToAPIType(v), nil
 }

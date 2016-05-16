@@ -6,6 +6,8 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/plugins"
+	"github.com/docker/libnetwork/datastore"
+	"github.com/docker/libnetwork/discoverapi"
 	"github.com/docker/libnetwork/driverapi"
 	"github.com/docker/libnetwork/drivers/remote/api"
 	"github.com/docker/libnetwork/types"
@@ -26,16 +28,40 @@ func newDriver(name string, client *plugins.Client) driverapi.Driver {
 
 // Init makes sure a remote driver is registered when a network driver
 // plugin is activated.
-func Init(dc driverapi.DriverCallback) error {
+func Init(dc driverapi.DriverCallback, config map[string]interface{}) error {
 	plugins.Handle(driverapi.NetworkPluginEndpointType, func(name string, client *plugins.Client) {
-		c := driverapi.Capability{
-			Scope: driverapi.GlobalScope,
+		// negotiate driver capability with client
+		d := newDriver(name, client)
+		c, err := d.(*driver).getCapabilities()
+		if err != nil {
+			log.Errorf("error getting capability for %s due to %v", name, err)
+			return
 		}
-		if err := dc.RegisterDriver(name, newDriver(name, client), c); err != nil {
+		if err = dc.RegisterDriver(name, d, *c); err != nil {
 			log.Errorf("error registering driver for %s due to %v", name, err)
 		}
 	})
 	return nil
+}
+
+// Get capability from client
+func (d *driver) getCapabilities() (*driverapi.Capability, error) {
+	var capResp api.GetCapabilityResponse
+	if err := d.call("GetCapabilities", nil, &capResp); err != nil {
+		return nil, err
+	}
+
+	c := &driverapi.Capability{}
+	switch capResp.Scope {
+	case "global":
+		c.DataScope = datastore.GlobalScope
+	case "local":
+		c.DataScope = datastore.LocalScope
+	default:
+		return nil, fmt.Errorf("invalid capability: expecting 'local' or 'global', got %s", capResp.Scope)
+	}
+
+	return c, nil
 }
 
 // Config is not implemented for remote drivers, since it is assumed
@@ -57,10 +83,12 @@ func (d *driver) call(methodName string, arg interface{}, retVal maybeError) err
 	return nil
 }
 
-func (d *driver) CreateNetwork(id string, options map[string]interface{}) error {
+func (d *driver) CreateNetwork(id string, options map[string]interface{}, ipV4Data, ipV6Data []driverapi.IPAMData) error {
 	create := &api.CreateNetworkRequest{
 		NetworkID: id,
 		Options:   options,
+		IPv4Data:  ipV4Data,
+		IPv6Data:  ipV6Data,
 	}
 	return d.call("CreateNetwork", create, &api.CreateNetworkResponse{})
 }
@@ -70,26 +98,26 @@ func (d *driver) DeleteNetwork(nid string) error {
 	return d.call("DeleteNetwork", delete, &api.DeleteNetworkResponse{})
 }
 
-func (d *driver) CreateEndpoint(nid, eid string, epInfo driverapi.EndpointInfo, epOptions map[string]interface{}) error {
-	if epInfo == nil {
-		return fmt.Errorf("must not be called with nil EndpointInfo")
+func (d *driver) CreateEndpoint(nid, eid string, ifInfo driverapi.InterfaceInfo, epOptions map[string]interface{}) error {
+	if ifInfo == nil {
+		return fmt.Errorf("must not be called with nil InterfaceInfo")
 	}
 
-	reqIfaces := make([]*api.EndpointInterface, len(epInfo.Interfaces()))
-	for i, iface := range epInfo.Interfaces() {
-		addr4 := iface.Address()
-		addr6 := iface.AddressIPv6()
-		reqIfaces[i] = &api.EndpointInterface{
-			ID:          iface.ID(),
-			Address:     addr4.String(),
-			AddressIPv6: addr6.String(),
-			MacAddress:  iface.MacAddress().String(),
-		}
+	reqIface := &api.EndpointInterface{}
+	if ifInfo.Address() != nil {
+		reqIface.Address = ifInfo.Address().String()
 	}
+	if ifInfo.AddressIPv6() != nil {
+		reqIface.AddressIPv6 = ifInfo.AddressIPv6().String()
+	}
+	if ifInfo.MacAddress() != nil {
+		reqIface.MacAddress = ifInfo.MacAddress().String()
+	}
+
 	create := &api.CreateEndpointRequest{
 		NetworkID:  nid,
 		EndpointID: eid,
-		Interfaces: reqIfaces,
+		Interface:  reqIface,
 		Options:    epOptions,
 	}
 	var res api.CreateEndpointResponse
@@ -97,27 +125,31 @@ func (d *driver) CreateEndpoint(nid, eid string, epInfo driverapi.EndpointInfo, 
 		return err
 	}
 
-	ifaces, err := parseInterfaces(res)
+	inIface, err := parseInterface(res)
 	if err != nil {
 		return err
 	}
-	if len(reqIfaces) > 0 && len(ifaces) > 0 {
-		// We're not supposed to add interfaces if there already are
-		// some. Attempt to roll back
-		return errorWithRollback("driver attempted to add more interfaces", d.DeleteEndpoint(nid, eid))
+	if inIface == nil {
+		// Remote driver did not set any field
+		return nil
 	}
-	for _, iface := range ifaces {
-		var addr4, addr6 net.IPNet
-		if iface.Address != nil {
-			addr4 = *(iface.Address)
-		}
-		if iface.AddressIPv6 != nil {
-			addr6 = *(iface.AddressIPv6)
-		}
-		if err := epInfo.AddInterface(iface.ID, iface.MacAddress, addr4, addr6); err != nil {
-			return errorWithRollback(fmt.Sprintf("failed to AddInterface %v: %s", iface, err), d.DeleteEndpoint(nid, eid))
+
+	if inIface.MacAddress != nil {
+		if err := ifInfo.SetMacAddress(inIface.MacAddress); err != nil {
+			return errorWithRollback(fmt.Sprintf("driver modified interface MAC address: %v", err), d.DeleteEndpoint(nid, eid))
 		}
 	}
+	if inIface.Address != nil {
+		if err := ifInfo.SetIPAddress(inIface.Address); err != nil {
+			return errorWithRollback(fmt.Sprintf("driver modified interface address: %v", err), d.DeleteEndpoint(nid, eid))
+		}
+	}
+	if inIface.AddressIPv6 != nil {
+		if err := ifInfo.SetIPAddress(inIface.AddressIPv6); err != nil {
+			return errorWithRollback(fmt.Sprintf("driver modified interface address: %v", err), d.DeleteEndpoint(nid, eid))
+		}
+	}
+
 	return nil
 }
 
@@ -165,18 +197,9 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 		return err
 	}
 
-	// Expect each interface ID given by CreateEndpoint to have an
-	// entry at that index in the names supplied here. In other words,
-	// if you supply 0..n interfaces with IDs 0..n above, you should
-	// supply the names in the same order.
-	ifaceNames := res.InterfaceNames
-	for _, iface := range jinfo.InterfaceNames() {
-		i := iface.ID()
-		if i >= len(ifaceNames) || i < 0 {
-			return fmt.Errorf("no correlating interface %d in supplied interface names", i)
-		}
-		supplied := ifaceNames[i]
-		if err := iface.SetNames(supplied.SrcName, supplied.DstPrefix); err != nil {
+	ifaceName := res.InterfaceName
+	if iface := jinfo.InterfaceName(); iface != nil && ifaceName != nil {
+		if err := iface.SetNames(ifaceName.SrcName, ifaceName.DstPrefix); err != nil {
 			return errorWithRollback(fmt.Sprintf("failed to set interface name: %s", err), d.Leave(nid, eid))
 		}
 	}
@@ -204,10 +227,13 @@ func (d *driver) Join(nid, eid string, sboxKey string, jinfo driverapi.JoinInfo,
 			return err
 		}
 		for _, route := range routes {
-			if jinfo.AddStaticRoute(route.Destination, route.RouteType, route.NextHop, route.InterfaceID) != nil {
+			if jinfo.AddStaticRoute(route.Destination, route.RouteType, route.NextHop) != nil {
 				return errorWithRollback(fmt.Sprintf("failed to set static route: %v", route), d.Leave(nid, eid))
 			}
 		}
+	}
+	if res.DisableGatewayService {
+		jinfo.DisableGatewayService()
 	}
 	return nil
 }
@@ -221,18 +247,71 @@ func (d *driver) Leave(nid, eid string) error {
 	return d.call("Leave", leave, &api.LeaveResponse{})
 }
 
+// ProgramExternalConnectivity is invoked to program the rules to allow external connectivity for the endpoint.
+func (d *driver) ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error {
+	data := &api.ProgramExternalConnectivityRequest{
+		NetworkID:  nid,
+		EndpointID: eid,
+		Options:    options,
+	}
+	err := d.call("ProgramExternalConnectivity", data, &api.ProgramExternalConnectivityResponse{})
+	if err != nil && plugins.IsNotFound(err) {
+		// It is not mandatory yet to support this method
+		return nil
+	}
+	return err
+}
+
+// RevokeExternalConnectivity method is invoked to remove any external connectivity programming related to the endpoint.
+func (d *driver) RevokeExternalConnectivity(nid, eid string) error {
+	data := &api.RevokeExternalConnectivityRequest{
+		NetworkID:  nid,
+		EndpointID: eid,
+	}
+	err := d.call("RevokeExternalConnectivity", data, &api.RevokeExternalConnectivityResponse{})
+	if err != nil && plugins.IsNotFound(err) {
+		// It is not mandatory yet to support this method
+		return nil
+	}
+	return err
+}
+
 func (d *driver) Type() string {
 	return d.networkType
+}
+
+// DiscoverNew is a notification for a new discovery event, such as a new node joining a cluster
+func (d *driver) DiscoverNew(dType discoverapi.DiscoveryType, data interface{}) error {
+	if dType != discoverapi.NodeDiscovery {
+		return fmt.Errorf("Unknown discovery type : %v", dType)
+	}
+	notif := &api.DiscoveryNotification{
+		DiscoveryType: dType,
+		DiscoveryData: data,
+	}
+	return d.call("DiscoverNew", notif, &api.DiscoveryResponse{})
+}
+
+// DiscoverDelete is a notification for a discovery delete event, such as a node leaving a cluster
+func (d *driver) DiscoverDelete(dType discoverapi.DiscoveryType, data interface{}) error {
+	if dType != discoverapi.NodeDiscovery {
+		return fmt.Errorf("Unknown discovery type : %v", dType)
+	}
+	notif := &api.DiscoveryNotification{
+		DiscoveryType: dType,
+		DiscoveryData: data,
+	}
+	return d.call("DiscoverDelete", notif, &api.DiscoveryResponse{})
 }
 
 func parseStaticRoutes(r api.JoinResponse) ([]*types.StaticRoute, error) {
 	var routes = make([]*types.StaticRoute, len(r.StaticRoutes))
 	for i, inRoute := range r.StaticRoutes {
 		var err error
-		outRoute := &types.StaticRoute{InterfaceID: inRoute.InterfaceID, RouteType: inRoute.RouteType}
+		outRoute := &types.StaticRoute{RouteType: inRoute.RouteType}
 
 		if inRoute.Destination != "" {
-			if outRoute.Destination, err = toAddr(inRoute.Destination); err != nil {
+			if outRoute.Destination, err = types.ParseCIDR(inRoute.Destination); err != nil {
 				return nil, err
 			}
 		}
@@ -250,20 +329,20 @@ func parseStaticRoutes(r api.JoinResponse) ([]*types.StaticRoute, error) {
 }
 
 // parseInterfaces validates all the parameters of an Interface and returns them.
-func parseInterfaces(r api.CreateEndpointResponse) ([]*api.Interface, error) {
-	var (
-		Interfaces = make([]*api.Interface, len(r.Interfaces))
-	)
-	for i, inIf := range r.Interfaces {
+func parseInterface(r api.CreateEndpointResponse) (*api.Interface, error) {
+	var outIf *api.Interface
+
+	inIf := r.Interface
+	if inIf != nil {
 		var err error
-		outIf := &api.Interface{ID: inIf.ID}
+		outIf = &api.Interface{}
 		if inIf.Address != "" {
-			if outIf.Address, err = toAddr(inIf.Address); err != nil {
+			if outIf.Address, err = types.ParseCIDR(inIf.Address); err != nil {
 				return nil, err
 			}
 		}
 		if inIf.AddressIPv6 != "" {
-			if outIf.AddressIPv6, err = toAddr(inIf.AddressIPv6); err != nil {
+			if outIf.AddressIPv6, err = types.ParseCIDR(inIf.AddressIPv6); err != nil {
 				return nil, err
 			}
 		}
@@ -272,16 +351,7 @@ func parseInterfaces(r api.CreateEndpointResponse) ([]*api.Interface, error) {
 				return nil, err
 			}
 		}
-		Interfaces[i] = outIf
 	}
-	return Interfaces, nil
-}
 
-func toAddr(ipAddr string) (*net.IPNet, error) {
-	ip, ipnet, err := net.ParseCIDR(ipAddr)
-	if err != nil {
-		return nil, err
-	}
-	ipnet.IP = ip
-	return ipnet, nil
+	return outIf, nil
 }

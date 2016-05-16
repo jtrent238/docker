@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/graphdriver"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/parsers"
 	zfs "github.com/mistifyio/go-zfs"
@@ -30,7 +31,7 @@ func init() {
 	graphdriver.Register("zfs", Init)
 }
 
-// Logger returns a zfs logger implmentation.
+// Logger returns a zfs logger implementation.
 type Logger struct{}
 
 // Log wraps log message from ZFS driver with a prefix '[zfs]'.
@@ -41,7 +42,7 @@ func (*Logger) Log(cmd []string) {
 // Init returns a new ZFS driver.
 // It takes base mount path and a array of options which are represented as key value pairs.
 // Each option is in the for key=value. 'zfs.fsname' is expected to be a valid key in the options.
-func Init(base string, opt []string) (graphdriver.Driver, error) {
+func Init(base string, opt []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
 	var err error
 
 	if _, err := exec.LookPath("zfs"); err != nil {
@@ -102,8 +103,10 @@ func Init(base string, opt []string) (graphdriver.Driver, error) {
 		dataset:          rootDataset,
 		options:          options,
 		filesystemsCache: filesystemsCache,
+		uidMaps:          uidMaps,
+		gidMaps:          gidMaps,
 	}
-	return graphdriver.NaiveDiffDriver(d), nil
+	return graphdriver.NewNaiveDiffDriver(d, uidMaps, gidMaps), nil
 }
 
 func parseOptions(opt []string) (zfsOptions, error) {
@@ -156,6 +159,8 @@ type Driver struct {
 	options          zfsOptions
 	sync.Mutex       // protects filesystem cache against concurrent access
 	filesystemsCache map[string]bool
+	uidMaps          []idtools.IDMap
+	gidMaps          []idtools.IDMap
 }
 
 func (d *Driver) String() string {
@@ -235,8 +240,18 @@ func (d *Driver) mountPath(id string) string {
 	return path.Join(d.options.mountPath, "graph", getMountpoint(id))
 }
 
+// CreateReadWrite creates a layer that is writable for use as a container
+// file system.
+func (d *Driver) CreateReadWrite(id, parent, mountLabel string, storageOpt map[string]string) error {
+	return d.Create(id, parent, mountLabel, storageOpt)
+}
+
 // Create prepares the dataset and filesystem for the ZFS driver for the given id under the parent.
-func (d *Driver) Create(id string, parent string) error {
+func (d *Driver) Create(id string, parent string, mountLabel string, storageOpt map[string]string) error {
+	if len(storageOpt) != 0 {
+		return fmt.Errorf("--storage-opt is not supported for zfs")
+	}
+
 	err := d.create(id, parent)
 	if err == nil {
 		return nil
@@ -294,14 +309,22 @@ func (d *Driver) Get(id, mountLabel string) (string, error) {
 	options := label.FormatMountLabel("", mountLabel)
 	logrus.Debugf(`[zfs] mount("%s", "%s", "%s")`, filesystem, mountpoint, options)
 
+	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
+	if err != nil {
+		return "", err
+	}
 	// Create the target directories if they don't exist
-	if err := os.MkdirAll(mountpoint, 0755); err != nil {
+	if err := idtools.MkdirAllAs(mountpoint, 0755, rootUID, rootGID); err != nil {
 		return "", err
 	}
 
-	err := mount.Mount(filesystem, mountpoint, "zfs", options)
-	if err != nil {
+	if err := mount.Mount(filesystem, mountpoint, "zfs", options); err != nil {
 		return "", fmt.Errorf("error creating zfs mount of %s to %s: %v", filesystem, mountpoint, err)
+	}
+	// this could be our first mount after creation of the filesystem, and the root dir may still have root
+	// permissions instead of the remapped root uid:gid (if user namespaces are enabled):
+	if err := os.Chown(mountpoint, rootUID, rootGID); err != nil {
+		return "", fmt.Errorf("error modifying zfs mountpoint (%s) directory ownership: %v", mountpoint, err)
 	}
 
 	return mountpoint, nil
@@ -310,6 +333,11 @@ func (d *Driver) Get(id, mountLabel string) (string, error) {
 // Put removes the existing mountpoint for the given id if it exists.
 func (d *Driver) Put(id string) error {
 	mountpoint := d.mountPath(id)
+	mounted, err := graphdriver.Mounted(graphdriver.FsMagicZfs, mountpoint)
+	if err != nil || !mounted {
+		return err
+	}
+
 	logrus.Debugf(`[zfs] unmount("%s")`, mountpoint)
 
 	if err := mount.Unmount(mountpoint); err != nil {
@@ -320,5 +348,7 @@ func (d *Driver) Put(id string) error {
 
 // Exists checks to see if the cache entry exists for the given id.
 func (d *Driver) Exists(id string) bool {
+	d.Lock()
+	defer d.Unlock()
 	return d.filesystemsCache[d.zfsPath(id)] == true
 }

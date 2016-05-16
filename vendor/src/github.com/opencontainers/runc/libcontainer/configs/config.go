@@ -1,5 +1,15 @@
 package configs
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os/exec"
+	"time"
+
+	"github.com/Sirupsen/logrus"
+)
+
 type Rlimit struct {
 	Type int    `json:"type"`
 	Hard uint64 `json:"hard"`
@@ -13,36 +23,51 @@ type IDMap struct {
 	Size        int `json:"size"`
 }
 
+// Seccomp represents syscall restrictions
+// By default, only the native architecture of the kernel is allowed to be used
+// for syscalls. Additional architectures can be added by specifying them in
+// Architectures.
 type Seccomp struct {
-	Syscalls []*Syscall `json:"syscalls"`
+	DefaultAction Action     `json:"default_action"`
+	Architectures []string   `json:"architectures"`
+	Syscalls      []*Syscall `json:"syscalls"`
 }
 
+// An action to be taken upon rule match in Seccomp
 type Action int
 
 const (
-	Kill Action = iota - 3
+	Kill Action = iota + 1
+	Errno
 	Trap
 	Allow
+	Trace
 )
 
+// A comparison operator to be used when matching syscall arguments in Seccomp
 type Operator int
 
 const (
-	EqualTo Operator = iota
+	EqualTo Operator = iota + 1
 	NotEqualTo
-	GreatherThan
+	GreaterThan
+	GreaterThanOrEqualTo
 	LessThan
+	LessThanOrEqualTo
 	MaskEqualTo
 )
 
+// A rule to match a specific syscall argument in Seccomp
 type Arg struct {
-	Index int      `json:"index"`
-	Value uint32   `json:"value"`
-	Op    Operator `json:"op"`
+	Index    uint     `json:"index"`
+	Value    uint64   `json:"value"`
+	ValueTwo uint64   `json:"value_two"`
+	Op       Operator `json:"op"`
 }
 
+// An rule to match a syscall in Seccomp
 type Syscall struct {
-	Value  int    `json:"value"`
+	Name   string `json:"name"`
 	Action Action `json:"action"`
 	Args   []*Arg `json:"args"`
 }
@@ -72,8 +97,8 @@ type Config struct {
 	// bind mounts are writtable.
 	Readonlyfs bool `json:"readonlyfs"`
 
-	// Privatefs will mount the container's rootfs as private where mount points from the parent will not propogate
-	Privatefs bool `json:"privatefs"`
+	// Specifies the mount propagation flags to be applied to /.
+	RootPropagation int `json:"rootPropagation"`
 
 	// Mounts specify additional source and destination paths that will be mounted inside the container's
 	// rootfs and mount namespace if specified
@@ -107,15 +132,21 @@ type Config struct {
 
 	// AppArmorProfile specifies the profile to apply to the process running in the container and is
 	// change at the time the process is execed
-	AppArmorProfile string `json:"apparmor_profile"`
+	AppArmorProfile string `json:"apparmor_profile,omitempty"`
 
 	// ProcessLabel specifies the label to apply to the process running in the container.  It is
 	// commonly used by selinux
-	ProcessLabel string `json:"process_label"`
+	ProcessLabel string `json:"process_label,omitempty"`
 
 	// Rlimits specifies the resource limits, such as max open files, to set in the container
 	// If Rlimits are not set, the container will inherit rlimits from the parent process
-	Rlimits []Rlimit `json:"rlimits"`
+	Rlimits []Rlimit `json:"rlimits,omitempty"`
+
+	// OomScoreAdj specifies the adjustment to be made by the kernel when calculating oom scores
+	// for a process. Valid values are between the range [-1000, '1000'], where processes with
+	// higher scores are preferred for being killed.
+	// More information about kernel oom score calculation here: https://lwn.net/Articles/317814/
+	OomScoreAdj int `json:"oom_score_adj"`
 
 	// AdditionalGroups specifies the gids that should be added to supplementary groups
 	// in addition to those that the user belongs to.
@@ -140,7 +171,153 @@ type Config struct {
 	Sysctl map[string]string `json:"sysctl"`
 
 	// Seccomp allows actions to be taken whenever a syscall is made within the container.
-	// By default, all syscalls are allowed with actions to allow, trap, kill, or return an errno
-	// can be specified on a per syscall basis.
+	// A number of rules are given, each having an action to be taken if a syscall matches it.
+	// A default action to be taken if no rules match is also given.
 	Seccomp *Seccomp `json:"seccomp"`
+
+	// NoNewPrivileges controls whether processes in the container can gain additional privileges.
+	NoNewPrivileges bool `json:"no_new_privileges,omitempty"`
+
+	// Hooks are a collection of actions to perform at various container lifecycle events.
+	// CommandHooks are serialized to JSON, but other hooks are not.
+	Hooks *Hooks
+
+	// Version is the version of opencontainer specification that is supported.
+	Version string `json:"version"`
+
+	// Labels are user defined metadata that is stored in the config and populated on the state
+	Labels []string `json:"labels"`
+}
+
+type Hooks struct {
+	// Prestart commands are executed after the container namespaces are created,
+	// but before the user supplied command is executed from init.
+	Prestart []Hook
+
+	// Poststart commands are executed after the container init process starts.
+	Poststart []Hook
+
+	// Poststop commands are executed after the container init process exits.
+	Poststop []Hook
+}
+
+func (hooks *Hooks) UnmarshalJSON(b []byte) error {
+	var state struct {
+		Prestart  []CommandHook
+		Poststart []CommandHook
+		Poststop  []CommandHook
+	}
+
+	if err := json.Unmarshal(b, &state); err != nil {
+		return err
+	}
+
+	deserialize := func(shooks []CommandHook) (hooks []Hook) {
+		for _, shook := range shooks {
+			hooks = append(hooks, shook)
+		}
+
+		return hooks
+	}
+
+	hooks.Prestart = deserialize(state.Prestart)
+	hooks.Poststart = deserialize(state.Poststart)
+	hooks.Poststop = deserialize(state.Poststop)
+	return nil
+}
+
+func (hooks Hooks) MarshalJSON() ([]byte, error) {
+	serialize := func(hooks []Hook) (serializableHooks []CommandHook) {
+		for _, hook := range hooks {
+			switch chook := hook.(type) {
+			case CommandHook:
+				serializableHooks = append(serializableHooks, chook)
+			default:
+				logrus.Warnf("cannot serialize hook of type %T, skipping", hook)
+			}
+		}
+
+		return serializableHooks
+	}
+
+	return json.Marshal(map[string]interface{}{
+		"prestart":  serialize(hooks.Prestart),
+		"poststart": serialize(hooks.Poststart),
+		"poststop":  serialize(hooks.Poststop),
+	})
+}
+
+// HookState is the payload provided to a hook on execution.
+type HookState struct {
+	Version string `json:"version"`
+	ID      string `json:"id"`
+	Pid     int    `json:"pid"`
+	Root    string `json:"root"`
+}
+
+type Hook interface {
+	// Run executes the hook with the provided state.
+	Run(HookState) error
+}
+
+// NewFunctionHooks will call the provided function when the hook is run.
+func NewFunctionHook(f func(HookState) error) FuncHook {
+	return FuncHook{
+		run: f,
+	}
+}
+
+type FuncHook struct {
+	run func(HookState) error
+}
+
+func (f FuncHook) Run(s HookState) error {
+	return f.run(s)
+}
+
+type Command struct {
+	Path    string         `json:"path"`
+	Args    []string       `json:"args"`
+	Env     []string       `json:"env"`
+	Dir     string         `json:"dir"`
+	Timeout *time.Duration `json:"timeout"`
+}
+
+// NewCommandHooks will execute the provided command when the hook is run.
+func NewCommandHook(cmd Command) CommandHook {
+	return CommandHook{
+		Command: cmd,
+	}
+}
+
+type CommandHook struct {
+	Command
+}
+
+func (c Command) Run(s HookState) error {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Cmd{
+		Path:  c.Path,
+		Args:  c.Args,
+		Env:   c.Env,
+		Stdin: bytes.NewReader(b),
+	}
+	errC := make(chan error, 1)
+	go func() {
+		errC <- cmd.Run()
+	}()
+	if c.Timeout != nil {
+		select {
+		case err := <-errC:
+			return err
+		case <-time.After(*c.Timeout):
+			cmd.Process.Kill()
+			cmd.Wait()
+			return fmt.Errorf("hook ran past specified timeout of %.1fs", c.Timeout.Seconds())
+		}
+	}
+	return <-errC
 }

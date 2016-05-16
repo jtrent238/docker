@@ -1,26 +1,25 @@
 package client
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/url"
+	"sort"
 	"text/tabwriter"
-	"text/template"
 
-	"github.com/docker/docker/api/types"
+	"golang.org/x/net/context"
+
 	Cli "github.com/docker/docker/cli"
 	"github.com/docker/docker/opts"
 	flag "github.com/docker/docker/pkg/mflag"
-	"github.com/docker/docker/pkg/parsers/filters"
+	runconfigopts "github.com/docker/docker/runconfig/opts"
+	"github.com/docker/engine-api/types"
+	"github.com/docker/engine-api/types/filters"
 )
 
 // CmdVolume is the parent subcommand for all volume commands
 //
 // Usage: docker volume <COMMAND> <OPTS>
 func (cli *DockerCli) CmdVolume(args ...string) error {
-	description := "Manage Docker volumes\n\nCommands:\n"
+	description := Cli.DockerCommands["volume"].Description + "\n\nCommands:\n"
 	commands := [][]string{
 		{"create", "Create a volume"},
 		{"inspect", "Return low-level information on a volume"},
@@ -32,12 +31,13 @@ func (cli *DockerCli) CmdVolume(args ...string) error {
 		description += fmt.Sprintf("  %-25.25s%s\n", cmd[0], cmd[1])
 	}
 
-	description += "\nRun 'docker volume COMMAND --help' for more information on a command."
-	cmd := Cli.Subcmd("volume", []string{"[COMMAND]"}, description, true)
-	cmd.Require(flag.Exact, 0)
-	cmd.ParseFlags(args, true)
+	description += "\nRun 'docker volume COMMAND --help' for more information on a command"
+	cmd := Cli.Subcmd("volume", []string{"[COMMAND]"}, description, false)
 
-	return cli.CmdVolumeLs(args...)
+	cmd.Require(flag.Exact, 0)
+	err := cmd.ParseFlags(args, true)
+	cmd.Usage()
+	return err
 }
 
 // CmdVolumeLs outputs a list of Docker volumes.
@@ -53,7 +53,7 @@ func (cli *DockerCli) CmdVolumeLs(args ...string) error {
 	cmd.Require(flag.Exact, 0)
 	cmd.ParseFlags(args, true)
 
-	volFilterArgs := filters.Args{}
+	volFilterArgs := filters.NewArgs()
 	for _, f := range flFilter.GetAll() {
 		var err error
 		volFilterArgs, err = filters.ParseFlag(f, volFilterArgs)
@@ -62,31 +62,21 @@ func (cli *DockerCli) CmdVolumeLs(args ...string) error {
 		}
 	}
 
-	v := url.Values{}
-	if len(volFilterArgs) > 0 {
-		filterJSON, err := filters.ToParam(volFilterArgs)
-		if err != nil {
-			return err
-		}
-		v.Set("filters", filterJSON)
-	}
-
-	resp, err := cli.call("GET", "/volumes?"+v.Encode(), nil, nil)
+	volumes, err := cli.client.VolumeList(context.Background(), volFilterArgs)
 	if err != nil {
-		return err
-	}
-
-	var volumes types.VolumesListResponse
-	if err := json.NewDecoder(resp.body).Decode(&volumes); err != nil {
 		return err
 	}
 
 	w := tabwriter.NewWriter(cli.out, 20, 1, 3, ' ', 0)
 	if !*quiet {
+		for _, warn := range volumes.Warnings {
+			fmt.Fprintln(cli.err, warn)
+		}
 		fmt.Fprintf(w, "DRIVER \tVOLUME NAME")
 		fmt.Fprintf(w, "\n")
 	}
 
+	sort.Sort(byVolumeName(volumes.Volumes))
 	for _, vol := range volumes.Volumes {
 		if *quiet {
 			fmt.Fprintln(w, vol.Name)
@@ -98,79 +88,37 @@ func (cli *DockerCli) CmdVolumeLs(args ...string) error {
 	return nil
 }
 
+type byVolumeName []*types.Volume
+
+func (r byVolumeName) Len() int      { return len(r) }
+func (r byVolumeName) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
+func (r byVolumeName) Less(i, j int) bool {
+	return r[i].Name < r[j].Name
+}
+
 // CmdVolumeInspect displays low-level information on one or more volumes.
 //
 // Usage: docker volume inspect [OPTIONS] VOLUME [VOLUME...]
 func (cli *DockerCli) CmdVolumeInspect(args ...string) error {
-	cmd := Cli.Subcmd("volume inspect", []string{"[VOLUME NAME]"}, "Return low-level information on a volume", true)
-	tmplStr := cmd.String([]string{"f", "-format"}, "", "Format the output using the given go template.")
-	if err := cmd.Parse(args); err != nil {
-		return nil
-	}
+	cmd := Cli.Subcmd("volume inspect", []string{"VOLUME [VOLUME...]"}, "Return low-level information on a volume", true)
+	tmplStr := cmd.String([]string{"f", "-format"}, "", "Format the output using the given go template")
 
 	cmd.Require(flag.Min, 1)
 	cmd.ParseFlags(args, true)
 
-	var tmpl *template.Template
-	if *tmplStr != "" {
-		var err error
-		tmpl, err = template.New("").Funcs(funcMap).Parse(*tmplStr)
-		if err != nil {
-			return err
-		}
-	}
-
-	var status = 0
-	var volumes []*types.Volume
-	for _, name := range cmd.Args() {
-		resp, err := cli.call("GET", "/volumes/"+name, nil, nil)
-		if err != nil {
-			return err
-		}
-
-		var volume types.Volume
-		if err := json.NewDecoder(resp.body).Decode(&volume); err != nil {
-			fmt.Fprintf(cli.err, "%s\n", err)
-			status = 1
-			continue
-		}
-
-		if tmpl == nil {
-			volumes = append(volumes, &volume)
-			continue
-		}
-
-		if err := tmpl.Execute(cli.out, &volume); err != nil {
-			if err := tmpl.Execute(cli.out, &volume); err != nil {
-				fmt.Fprintf(cli.err, "%s\n", err)
-				status = 1
-				continue
-			}
-		}
-		io.WriteString(cli.out, "\n")
-	}
-
-	if tmpl != nil {
+	if err := cmd.Parse(args); err != nil {
 		return nil
 	}
 
-	b, err := json.MarshalIndent(volumes, "", "    ")
-	if err != nil {
-		return err
+	inspectSearcher := func(name string) (interface{}, []byte, error) {
+		i, err := cli.client.VolumeInspect(context.Background(), name)
+		return i, nil, err
 	}
-	_, err = io.Copy(cli.out, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	io.WriteString(cli.out, "\n")
 
-	if status != 0 {
-		return Cli.StatusError{StatusCode: status}
-	}
-	return nil
+	return cli.inspectElements(*tmplStr, cmd.Args(), inspectSearcher)
 }
 
-// CmdVolumeCreate creates a new container from a given image.
+// CmdVolumeCreate creates a new volume.
 //
 // Usage: docker volume create [OPTIONS]
 func (cli *DockerCli) CmdVolumeCreate(args ...string) error {
@@ -181,43 +129,40 @@ func (cli *DockerCli) CmdVolumeCreate(args ...string) error {
 	flDriverOpts := opts.NewMapOpts(nil, nil)
 	cmd.Var(flDriverOpts, []string{"o", "-opt"}, "Set driver specific options")
 
+	flLabels := opts.NewListOpts(nil)
+	cmd.Var(&flLabels, []string{"-label"}, "Set metadata for a volume")
+
 	cmd.Require(flag.Exact, 0)
 	cmd.ParseFlags(args, true)
 
-	volReq := &types.VolumeCreateRequest{
+	volReq := types.VolumeCreateRequest{
 		Driver:     *flDriver,
 		DriverOpts: flDriverOpts.GetAll(),
+		Name:       *flName,
+		Labels:     runconfigopts.ConvertKVStringsToMap(flLabels.GetAll()),
 	}
 
-	if *flName != "" {
-		volReq.Name = *flName
-	}
-
-	resp, err := cli.call("POST", "/volumes", volReq, nil)
+	vol, err := cli.client.VolumeCreate(context.Background(), volReq)
 	if err != nil {
 		return err
 	}
 
-	var vol types.Volume
-	if err := json.NewDecoder(resp.body).Decode(&vol); err != nil {
-		return err
-	}
 	fmt.Fprintf(cli.out, "%s\n", vol.Name)
 	return nil
 }
 
-// CmdVolumeRm removes one or more containers.
+// CmdVolumeRm removes one or more volumes.
 //
 // Usage: docker volume rm VOLUME [VOLUME...]
 func (cli *DockerCli) CmdVolumeRm(args ...string) error {
-	cmd := Cli.Subcmd("volume rm", []string{"[NAME]"}, "Remove a volume", true)
+	cmd := Cli.Subcmd("volume rm", []string{"VOLUME [VOLUME...]"}, "Remove a volume", true)
 	cmd.Require(flag.Min, 1)
 	cmd.ParseFlags(args, true)
 
 	var status = 0
+
 	for _, name := range cmd.Args() {
-		_, err := cli.call("DELETE", "/volumes/"+name, nil, nil)
-		if err != nil {
+		if err := cli.client.VolumeRemove(context.Background(), name); err != nil {
 			fmt.Fprintf(cli.err, "%s\n", err)
 			status = 1
 			continue

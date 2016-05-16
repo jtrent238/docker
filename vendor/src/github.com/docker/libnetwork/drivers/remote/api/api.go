@@ -4,7 +4,12 @@ with a remote driver.
 */
 package api
 
-import "net"
+import (
+	"net"
+
+	"github.com/docker/libnetwork/discoverapi"
+	"github.com/docker/libnetwork/driverapi"
+)
 
 // Response is the basic response structure used in all responses.
 type Response struct {
@@ -16,6 +21,12 @@ func (r *Response) GetError() string {
 	return r.Err
 }
 
+// GetCapabilityResponse is the response of GetCapability request
+type GetCapabilityResponse struct {
+	Response
+	Scope string
+}
+
 // CreateNetworkRequest requests a new network.
 type CreateNetworkRequest struct {
 	// A network ID that remote plugins are expected to store for future
@@ -24,6 +35,9 @@ type CreateNetworkRequest struct {
 
 	// A free form map->object interface for communication of options.
 	Options map[string]interface{}
+
+	// IPAMData contains the address pool information for this network
+	IPv4Data, IPv6Data []driverapi.IPAMData
 }
 
 // CreateNetworkResponse is the response to the CreateNetworkRequest.
@@ -48,13 +62,12 @@ type CreateEndpointRequest struct {
 	NetworkID string
 	// The ID of the endpoint for later reference.
 	EndpointID string
-	Interfaces []*EndpointInterface
+	Interface  *EndpointInterface
 	Options    map[string]interface{}
 }
 
 // EndpointInterface represents an interface endpoint.
 type EndpointInterface struct {
-	ID          int
 	Address     string
 	AddressIPv6 string
 	MacAddress  string
@@ -63,12 +76,11 @@ type EndpointInterface struct {
 // CreateEndpointResponse is the response to the CreateEndpoint action.
 type CreateEndpointResponse struct {
 	Response
-	Interfaces []*EndpointInterface
+	Interface *EndpointInterface
 }
 
 // Interface is the representation of a linux interface.
 type Interface struct {
-	ID          int
 	Address     *net.IPNet
 	AddressIPv6 *net.IPNet
 	MacAddress  net.HardwareAddr
@@ -118,16 +130,16 @@ type StaticRoute struct {
 	Destination string
 	RouteType   int
 	NextHop     string
-	InterfaceID int
 }
 
 // JoinResponse is the response to a JoinRequest.
 type JoinResponse struct {
 	Response
-	InterfaceNames []*InterfaceName
-	Gateway        string
-	GatewayIPv6    string
-	StaticRoutes   []StaticRoute
+	InterfaceName         *InterfaceName
+	Gateway               string
+	GatewayIPv6           string
+	StaticRoutes          []StaticRoute
+	DisableGatewayService bool
 }
 
 // LeaveRequest describes the API for detaching an endpoint from a sandbox.
@@ -138,5 +150,39 @@ type LeaveRequest struct {
 
 // LeaveResponse is the answer to LeaveRequest.
 type LeaveResponse struct {
+	Response
+}
+
+// ProgramExternalConnectivityRequest describes the API for programming the external connectivity for the given endpoint.
+type ProgramExternalConnectivityRequest struct {
+	NetworkID  string
+	EndpointID string
+	Options    map[string]interface{}
+}
+
+// ProgramExternalConnectivityResponse is the answer to ProgramExternalConnectivityRequest.
+type ProgramExternalConnectivityResponse struct {
+	Response
+}
+
+// RevokeExternalConnectivityRequest describes the API for revoking the external connectivity for the given endpoint.
+type RevokeExternalConnectivityRequest struct {
+	NetworkID  string
+	EndpointID string
+}
+
+// RevokeExternalConnectivityResponse is the answer to RevokeExternalConnectivityRequest.
+type RevokeExternalConnectivityResponse struct {
+	Response
+}
+
+// DiscoveryNotification represents a discovery notification
+type DiscoveryNotification struct {
+	DiscoveryType discoverapi.DiscoveryType
+	DiscoveryData interface{}
+}
+
+// DiscoveryResponse is used by libnetwork to log any plugin error processing the discovery notifications
+type DiscoveryResponse struct {
 	Response
 }

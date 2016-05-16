@@ -7,6 +7,10 @@ package btrfs
 #include <dirent.h>
 #include <btrfs/ioctl.h>
 #include <btrfs/ctree.h>
+
+static void set_name_btrfs_ioctl_vol_args_v2(struct btrfs_ioctl_vol_args_v2* btrfs_struct, const char* value) {
+    snprintf(btrfs_struct->name, BTRFS_SUBVOL_NAME_MAX, "%s", value);
+}
 */
 import "C"
 
@@ -19,7 +23,9 @@ import (
 	"unsafe"
 
 	"github.com/docker/docker/daemon/graphdriver"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/mount"
+	"github.com/opencontainers/runc/libcontainer/label"
 )
 
 func init() {
@@ -28,19 +34,22 @@ func init() {
 
 // Init returns a new BTRFS driver.
 // An error is returned if BTRFS is not supported.
-func Init(home string, options []string) (graphdriver.Driver, error) {
-	rootdir := path.Dir(home)
+func Init(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
 
-	var buf syscall.Statfs_t
-	if err := syscall.Statfs(rootdir, &buf); err != nil {
+	fsMagic, err := graphdriver.GetFSMagic(home)
+	if err != nil {
 		return nil, err
 	}
 
-	if graphdriver.FsMagic(buf.Type) != graphdriver.FsMagicBtrfs {
+	if fsMagic != graphdriver.FsMagicBtrfs {
 		return nil, graphdriver.ErrPrerequisites
 	}
 
-	if err := os.MkdirAll(home, 0700); err != nil {
+	rootUID, rootGID, err := idtools.GetRootUIDGID(uidMaps, gidMaps)
+	if err != nil {
+		return nil, err
+	}
+	if err := idtools.MkdirAllAs(home, 0700, rootUID, rootGID); err != nil {
 		return nil, err
 	}
 
@@ -49,16 +58,20 @@ func Init(home string, options []string) (graphdriver.Driver, error) {
 	}
 
 	driver := &Driver{
-		home: home,
+		home:    home,
+		uidMaps: uidMaps,
+		gidMaps: gidMaps,
 	}
 
-	return graphdriver.NaiveDiffDriver(driver), nil
+	return graphdriver.NewNaiveDiffDriver(driver, uidMaps, gidMaps), nil
 }
 
 // Driver contains information about the filesystem mounted.
 type Driver struct {
 	//root of the file system
-	home string
+	home    string
+	uidMaps []idtools.IDMap
+	gidMaps []idtools.IDMap
 }
 
 // String prints the name of the driver (btrfs).
@@ -150,9 +163,10 @@ func subvolSnapshot(src, dest, name string) error {
 
 	var args C.struct_btrfs_ioctl_vol_args_v2
 	args.fd = C.__s64(getDirFd(srcDir))
-	for i, c := range []byte(name) {
-		args.name[i] = C.char(c)
-	}
+
+	var cs = C.CString(name)
+	C.set_name_btrfs_ioctl_vol_args_v2(&args, cs)
+	C.free(unsafe.Pointer(cs))
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, getDirFd(destDir), C.BTRFS_IOC_SNAP_CREATE_V2,
 		uintptr(unsafe.Pointer(&args)))
@@ -178,20 +192,29 @@ func subvolDelete(dirpath, name string) error {
 		return err
 	}
 	defer closeDir(dir)
+	fullPath := path.Join(dirpath, name)
 
 	var args C.struct_btrfs_ioctl_vol_args
 
 	// walk the btrfs subvolumes
 	walkSubvolumes := func(p string, f os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) && p != fullPath {
+				// missing most likely because the path was a subvolume that got removed in the previous iteration
+				// since it's gone anyway, we don't care
+				return nil
+			}
+			return fmt.Errorf("error walking subvolumes: %v", err)
+		}
 		// we want to check children only so skip itself
 		// it will be removed after the filepath walk anyways
-		if f.IsDir() && p != path.Join(dirpath, name) {
+		if f.IsDir() && p != fullPath {
 			sv, err := isSubvolume(p)
 			if err != nil {
 				return fmt.Errorf("Failed to test if %s is a btrfs subvolume: %v", p, err)
 			}
 			if sv {
-				if err := subvolDelete(p, f.Name()); err != nil {
+				if err := subvolDelete(path.Dir(p), f.Name()); err != nil {
 					return fmt.Errorf("Failed to destroy btrfs child subvolume (%s) of parent (%s): %v", p, dirpath, err)
 				}
 			}
@@ -223,10 +246,25 @@ func (d *Driver) subvolumesDirID(id string) string {
 	return path.Join(d.subvolumesDir(), id)
 }
 
+// CreateReadWrite creates a layer that is writable for use as a container
+// file system.
+func (d *Driver) CreateReadWrite(id, parent, mountLabel string, storageOpt map[string]string) error {
+	return d.Create(id, parent, mountLabel, storageOpt)
+}
+
 // Create the filesystem with given id.
-func (d *Driver) Create(id string, parent string) error {
+func (d *Driver) Create(id, parent, mountLabel string, storageOpt map[string]string) error {
+
+	if len(storageOpt) != 0 {
+		return fmt.Errorf("--storage-opt is not supported for btrfs")
+	}
+
 	subvolumes := path.Join(d.home, "subvolumes")
-	if err := os.MkdirAll(subvolumes, 0700); err != nil {
+	rootUID, rootGID, err := idtools.GetRootUIDGID(d.uidMaps, d.gidMaps)
+	if err != nil {
+		return err
+	}
+	if err := idtools.MkdirAllAs(subvolumes, 0700, rootUID, rootGID); err != nil {
 		return err
 	}
 	if parent == "" {
@@ -234,15 +272,28 @@ func (d *Driver) Create(id string, parent string) error {
 			return err
 		}
 	} else {
-		parentDir, err := d.Get(parent, "")
+		parentDir := d.subvolumesDirID(parent)
+		st, err := os.Stat(parentDir)
 		if err != nil {
 			return err
+		}
+		if !st.IsDir() {
+			return fmt.Errorf("%s: not a directory", parentDir)
 		}
 		if err := subvolSnapshot(parentDir, subvolumes, id); err != nil {
 			return err
 		}
 	}
-	return nil
+
+	// if we have a remapped root (user namespaces enabled), change the created snapshot
+	// dir ownership to match
+	if rootUID != 0 || rootGID != 0 {
+		if err := os.Chown(path.Join(subvolumes, id), rootUID, rootGID); err != nil {
+			return err
+		}
+	}
+
+	return label.Relabel(path.Join(subvolumes, id), mountLabel, false)
 }
 
 // Remove the filesystem with given id.
@@ -254,7 +305,10 @@ func (d *Driver) Remove(id string) error {
 	if err := subvolDelete(d.subvolumesDir(), id); err != nil {
 		return err
 	}
-	return os.RemoveAll(dir)
+	if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // Get the requested filesystem id.

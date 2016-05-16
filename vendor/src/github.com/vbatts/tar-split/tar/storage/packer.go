@@ -1,11 +1,11 @@
 package storage
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
+	"unicode/utf8"
 )
 
 // ErrDuplicatePath occurs when a tar archive has more than one entry for the
@@ -32,36 +32,20 @@ type PackUnpacker interface {
 */
 
 type jsonUnpacker struct {
-	r     io.Reader
-	b     *bufio.Reader
-	isEOF bool
-	seen  seenNames
+	seen seenNames
+	dec  *json.Decoder
 }
 
 func (jup *jsonUnpacker) Next() (*Entry, error) {
 	var e Entry
-	if jup.isEOF {
-		// since ReadBytes() will return read bytes AND an EOF, we handle it this
-		// round-a-bout way so we can Unmarshal the tail with relevant errors, but
-		// still get an io.EOF when the stream is ended.
-		return nil, io.EOF
-	}
-	line, err := jup.b.ReadBytes('\n')
-	if err != nil && err != io.EOF {
+	err := jup.dec.Decode(&e)
+	if err != nil {
 		return nil, err
-	} else if err == io.EOF {
-		jup.isEOF = true
-	}
-
-	err = json.Unmarshal(line, &e)
-	if err != nil && jup.isEOF {
-		// if the remainder actually _wasn't_ a remaining json structure, then just EOF
-		return nil, io.EOF
 	}
 
 	// check for dup name
 	if e.Type == FileType {
-		cName := filepath.Clean(e.Name)
+		cName := filepath.Clean(e.GetName())
 		if _, ok := jup.seen[cName]; ok {
 			return nil, ErrDuplicatePath
 		}
@@ -77,8 +61,7 @@ func (jup *jsonUnpacker) Next() (*Entry, error) {
 // Each Entry read are expected to be delimited by new line.
 func NewJSONUnpacker(r io.Reader) Unpacker {
 	return &jsonUnpacker{
-		r:    r,
-		b:    bufio.NewReader(r),
+		dec:  json.NewDecoder(r),
 		seen: seenNames{},
 	}
 }
@@ -93,9 +76,17 @@ type jsonPacker struct {
 type seenNames map[string]struct{}
 
 func (jp *jsonPacker) AddEntry(e Entry) (int, error) {
+	// if Name is not valid utf8, switch it to raw first.
+	if e.Name != "" {
+		if !utf8.ValidString(e.Name) {
+			e.NameRaw = []byte(e.Name)
+			e.Name = ""
+		}
+	}
+
 	// check early for dup name
 	if e.Type == FileType {
-		cName := filepath.Clean(e.Name)
+		cName := filepath.Clean(e.GetName())
 		if _, ok := jp.seen[cName]; ok {
 			return -1, ErrDuplicatePath
 		}

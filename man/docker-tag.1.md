@@ -6,7 +6,6 @@ docker-tag - Tag an image into a repository
 
 # SYNOPSIS
 **docker tag**
-[**-f**|**--force**[=*false*]]
 [**--help**]
 IMAGE[:TAG] [REGISTRY_HOST/][USERNAME/]NAME[:TAG]
 
@@ -18,10 +17,10 @@ If you do not specify a `REGISTRY_HOST`, the command uses Docker's public
 registry located at `registry-1.docker.io` by default. 
 
 # "OPTIONS"
-**-f**, **--force**=*true*|*false*
-   When set to true, force the alias. The default is *false*.
+**--help**
+   Print usage statement.
 
-**REGISTRYHOST**
+**REGISTRY_HOST**
    The hostname of the registry if required. This may also include the port
 separated by a ':'
 
@@ -36,10 +35,6 @@ separated by a ':'
 recommended to be used for a version to distinguish images with the same name.
 Also, for consistency tags should only include a-z0-9-_. .
 Note that here TAG is a part of the overall name or "tag".
-
-# OPTIONS
-**-f**, **--force**=*true*|*false*
-   Force. The default is *false*.
 
 # EXAMPLES
 

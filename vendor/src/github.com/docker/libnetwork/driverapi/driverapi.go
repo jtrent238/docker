@@ -1,19 +1,22 @@
 package driverapi
 
-import "net"
+import (
+	"net"
+
+	"github.com/docker/libnetwork/discoverapi"
+)
 
 // NetworkPluginEndpointType represents the Endpoint Type used by Plugin system
 const NetworkPluginEndpointType = "NetworkDriver"
 
 // Driver is an interface that every plugin driver needs to implement.
 type Driver interface {
-	// Push driver specific config to the driver
-	Config(options map[string]interface{}) error
+	discoverapi.Discover
 
 	// CreateNetwork invokes the driver method to create a network passing
 	// the network id and network specific config. The config mechanism will
 	// eventually be replaced with labels which are yet to be introduced.
-	CreateNetwork(nid string, options map[string]interface{}) error
+	CreateNetwork(nid string, options map[string]interface{}, ipV4Data, ipV6Data []IPAMData) error
 
 	// DeleteNetwork invokes the driver method to delete network passing
 	// the network id.
@@ -24,7 +27,7 @@ type Driver interface {
 	// specific config. The endpoint information can be either consumed by
 	// the driver or populated by the driver. The config mechanism will
 	// eventually be replaced with labels which are yet to be introduced.
-	CreateEndpoint(nid, eid string, epInfo EndpointInfo, options map[string]interface{}) error
+	CreateEndpoint(nid, eid string, ifInfo InterfaceInfo, options map[string]interface{}) error
 
 	// DeleteEndpoint invokes the driver method to delete an endpoint
 	// passing the network id and endpoint id.
@@ -39,41 +42,38 @@ type Driver interface {
 	// Leave method is invoked when a Sandbox detaches from an endpoint.
 	Leave(nid, eid string) error
 
+	// ProgramExternalConnectivity invokes the driver method which does the necessary
+	// programming to allow the external connectivity dictated by the passed options
+	ProgramExternalConnectivity(nid, eid string, options map[string]interface{}) error
+
+	// RevokeExternalConnectivity aks the driver to remove any external connectivity
+	// programming that was done so far
+	RevokeExternalConnectivity(nid, eid string) error
+
 	// Type returns the the type of this driver, the network type this driver manages
 	Type() string
-}
-
-// EndpointInfo provides a go interface to fetch or populate endpoint assigned network resources.
-type EndpointInfo interface {
-	// Interfaces returns a list of interfaces bound to the endpoint.
-	// If the list is not empty the driver is only expected to consume the interfaces.
-	// It is an error to try to add interfaces to a non-empty list.
-	// If the list is empty the driver is expected to populate with 0 or more interfaces.
-	Interfaces() []InterfaceInfo
-
-	// AddInterface is used by the driver to add an interface to the interface list.
-	// This method will return an error if the driver attempts to add interfaces
-	// if the Interfaces() method returned a non-empty list.
-	// ID field need only have significance within the endpoint so it can be a simple
-	// monotonically increasing number
-	AddInterface(ID int, mac net.HardwareAddr, ipv4 net.IPNet, ipv6 net.IPNet) error
 }
 
 // InterfaceInfo provides a go interface for drivers to retrive
 // network information to interface resources.
 type InterfaceInfo interface {
+	// SetMacAddress allows the driver to set the mac address to the endpoint interface
+	// during the call to CreateEndpoint, if the mac address is not already set.
+	SetMacAddress(mac net.HardwareAddr) error
+
+	// SetIPAddress allows the driver to set the ip address to the endpoint interface
+	// during the call to CreateEndpoint, if the address is not already set.
+	// The API is to be used to assign both the IPv4 and IPv6 address types.
+	SetIPAddress(ip *net.IPNet) error
+
 	// MacAddress returns the MAC address.
 	MacAddress() net.HardwareAddr
 
 	// Address returns the IPv4 address.
-	Address() net.IPNet
+	Address() *net.IPNet
 
 	// AddressIPv6 returns the IPv6 address.
-	AddressIPv6() net.IPNet
-
-	// ID returns the numerical id of the interface and has significance only within
-	// the endpoint.
-	ID() int
+	AddressIPv6() *net.IPNet
 }
 
 // InterfaceNameInfo provides a go interface for the drivers to assign names
@@ -81,18 +81,14 @@ type InterfaceInfo interface {
 type InterfaceNameInfo interface {
 	// SetNames method assigns the srcName and dstPrefix for the interface.
 	SetNames(srcName, dstPrefix string) error
-
-	// ID returns the numerical id that was assigned to the interface by the driver
-	// CreateEndpoint.
-	ID() int
 }
 
 // JoinInfo represents a set of resources that the driver has the ability to provide during
 // join time.
 type JoinInfo interface {
-	// InterfaceNames returns a list of InterfaceNameInfo go interface to facilitate
-	// setting the names for the interfaces.
-	InterfaceNames() []InterfaceNameInfo
+	// InterfaceName returns a InterfaceNameInfo go interface to facilitate
+	// setting the names for the interface.
+	InterfaceName() InterfaceNameInfo
 
 	// SetGateway sets the default IPv4 gateway when a container joins the endpoint.
 	SetGateway(net.IP) error
@@ -100,9 +96,12 @@ type JoinInfo interface {
 	// SetGatewayIPv6 sets the default IPv6 gateway when a container joins the endpoint.
 	SetGatewayIPv6(net.IP) error
 
-	// AddStaticRoute adds a routes to the sandbox.
-	// It may be used in addtion to or instead of a default gateway (as above).
-	AddStaticRoute(destination *net.IPNet, routeType int, nextHop net.IP, interfaceID int) error
+	// AddStaticRoute adds a route to the sandbox.
+	// It may be used in addition to or instead of a default gateway (as above).
+	AddStaticRoute(destination *net.IPNet, routeType int, nextHop net.IP) error
+
+	// DisableGatewayService tells libnetwork not to provide Default GW for the container
+	DisableGatewayService()
 }
 
 // DriverCallback provides a Callback interface for Drivers into LibNetwork
@@ -111,17 +110,17 @@ type DriverCallback interface {
 	RegisterDriver(name string, driver Driver, capability Capability) error
 }
 
-// Scope indicates the drivers scope capability
-type Scope int
-
-const (
-	// LocalScope represents the driver capable of providing networking services for containers in a single host
-	LocalScope Scope = iota
-	// GlobalScope represents the driver capable of providing networking services for containers across hosts
-	GlobalScope
-)
-
 // Capability represents the high level capabilities of the drivers which libnetwork can make use of
 type Capability struct {
-	Scope Scope
+	DataScope string
+}
+
+// IPAMData represents the per-network ip related
+// operational information libnetwork will send
+// to the network driver during CreateNetwork()
+type IPAMData struct {
+	AddressSpace string
+	Pool         *net.IPNet
+	Gateway      *net.IPNet
+	AuxAddresses map[string]*net.IPNet
 }

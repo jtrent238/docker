@@ -12,6 +12,7 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/reexec"
+	"github.com/docker/libnetwork/ns"
 	"github.com/docker/libnetwork/types"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -27,7 +28,6 @@ var (
 	gpmCleanupPeriod = 60 * time.Second
 	gpmChan          = make(chan chan struct{})
 	nsOnce           sync.Once
-	initNs           netns.NsHandle
 )
 
 // The networkNamespace type is the linux implementation of the Sandbox
@@ -41,6 +41,7 @@ type networkNamespace struct {
 	staticRoutes []*types.StaticRoute
 	neighbors    []*neigh
 	nextIfIndex  int
+	isDefault    bool
 	sync.Mutex
 }
 
@@ -49,7 +50,7 @@ func init() {
 }
 
 func createBasePath() {
-	err := os.MkdirAll(prefix, 0644)
+	err := os.MkdirAll(prefix, 0755)
 	if err != nil {
 		panic("Could not create net namespace path directory")
 	}
@@ -146,7 +147,7 @@ func NewSandbox(key string, osCreate bool) (Sandbox, error) {
 		return nil, err
 	}
 
-	return &networkNamespace{path: key}, nil
+	return &networkNamespace{path: key, isDefault: !osCreate}, nil
 }
 
 func (n *networkNamespace) InterfaceOptions() IfaceOptionSetter {
@@ -157,30 +158,43 @@ func (n *networkNamespace) NeighborOptions() NeighborOptionSetter {
 	return n
 }
 
+func mountNetworkNamespace(basePath string, lnPath string) error {
+	if err := syscall.Mount(basePath, lnPath, "bind", syscall.MS_BIND, ""); err != nil {
+		return err
+	}
+
+	if err := loopbackUp(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// GetSandboxForExternalKey returns sandbox object for the supplied path
+func GetSandboxForExternalKey(basePath string, key string) (Sandbox, error) {
+	var err error
+	if err = createNamespaceFile(key); err != nil {
+		return nil, err
+	}
+	n := &networkNamespace{path: basePath}
+	n.InvokeFunc(func() {
+		err = mountNetworkNamespace(basePath, key)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &networkNamespace{path: key}, nil
+}
+
 func reexecCreateNamespace() {
 	if len(os.Args) < 2 {
 		log.Fatal("no namespace path provided")
 	}
-
-	if err := syscall.Mount("/proc/self/ns/net", os.Args[1], "bind", syscall.MS_BIND, ""); err != nil {
-		log.Fatal(err)
-	}
-
-	if err := loopbackUp(); err != nil {
+	if err := mountNetworkNamespace("/proc/self/ns/net", os.Args[1]); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func createNetworkNamespace(path string, osCreate bool) error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	origns, err := netns.Get()
-	if err != nil {
-		return err
-	}
-	defer origns.Close()
-
 	if err := createNamespaceFile(path); err != nil {
 		return err
 	}
@@ -244,30 +258,12 @@ func (n *networkNamespace) InvokeFunc(f func()) error {
 	})
 }
 
-func getLink() (string, error) {
-	return os.Readlink(fmt.Sprintf("/proc/%d/task/%d/ns/net", os.Getpid(), syscall.Gettid()))
-}
-
-func nsInit() {
-	var err error
-
-	if initNs, err = netns.Get(); err != nil {
-		log.Errorf("could not get initial namespace: %v", err)
-	}
-}
-
 // InitOSContext initializes OS context while configuring network resources
 func InitOSContext() func() {
 	runtime.LockOSThread()
-	nsOnce.Do(nsInit)
-	if err := netns.Set(initNs); err != nil {
-		linkInfo, linkErr := getLink()
-		if linkErr != nil {
-			linkInfo = linkErr.Error()
-		}
-
-		log.Errorf("failed to set to initial namespace, %v, initns fd %d: %v",
-			linkInfo, initNs, err)
+	nsOnce.Do(ns.Init)
+	if err := ns.SetNamespace(); err != nil {
+		log.Error(err)
 	}
 
 	return runtime.UnlockOSThread
@@ -293,10 +289,10 @@ func nsInvoke(path string, prefunc func(nsFD int) error, postfunc func(callerFD 
 	if err = netns.Set(netns.NsHandle(nsFD)); err != nil {
 		return err
 	}
-	defer netns.Set(initNs)
+	defer ns.SetNamespace()
 
 	// Invoked after the namespace switch.
-	return postfunc(int(initNs))
+	return postfunc(ns.ParseHandlerInt())
 }
 
 func (n *networkNamespace) nsPath() string {

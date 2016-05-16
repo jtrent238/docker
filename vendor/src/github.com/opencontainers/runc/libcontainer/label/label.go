@@ -29,7 +29,7 @@ func SetFileCreateLabel(fileLabel string) error {
 	return nil
 }
 
-func Relabel(path string, fileLabel string, relabel string) error {
+func Relabel(path string, fileLabel string, shared bool) error {
 	return nil
 }
 
@@ -48,7 +48,7 @@ func UnreserveLabel(label string) error {
 	return nil
 }
 
-// DupSecOpt takes an process label and returns security options that
+// DupSecOpt takes a process label and returns security options that
 // can be used to set duplicate labels on future container processes
 func DupSecOpt(src string) []string {
 	return nil
@@ -58,4 +58,19 @@ func DupSecOpt(src string) []string {
 // support for future container processes
 func DisableSecOpt() []string {
 	return nil
+}
+
+// Validate checks that the label does not include unexpected options
+func Validate(label string) error {
+	return nil
+}
+
+// RelabelNeeded checks whether the user requested a relabel
+func RelabelNeeded(label string) bool {
+	return false
+}
+
+// IsShared checks that the label includes a "shared" mark
+func IsShared(label string) bool {
+	return false
 }
